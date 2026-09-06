@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import admin
+from app.api import admin, assistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,4 +50,5 @@ async def health_check() -> dict:
     return {"status": "healthy"}
 
 
+app.include_router(assistant.router)
 app.include_router(admin.router)
