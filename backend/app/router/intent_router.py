@@ -101,6 +101,21 @@ class IntentRouter:
         if self._matches(normalized, self.career_patterns):
             return IntentRouteResult(Intent.career_planning, 0.85)
 
+        if has_file and not normalized:
+            return IntentRouteResult(
+                Intent.unknown,
+                0.2,
+                needs_clarification=True,
+                message="我已收到你的文件，请问你是希望进行简历评估、根据简历进行模拟面试、分析面试录音、生成求职信，还是做职业规划？",
+            )
+        if has_file and normalized in {"看看", "帮我看看", "处理一下", "分析一下"}:
+            return IntentRouteResult(
+                Intent.unknown,
+                0.35,
+                needs_clarification=True,
+                message="我已收到你的文件，请问你是希望进行简历评估、根据简历进行模拟面试、分析面试录音、生成求职信，还是做职业规划？",
+            )
+
         return IntentRouteResult(Intent.unknown, 0.1, message="暂时无法识别你的需求，请说明想进行简历评估、模拟面试、录音分析、求职信生成或职业规划。")
 
     def _matches(self, text: str, patterns: list[str]) -> bool:
