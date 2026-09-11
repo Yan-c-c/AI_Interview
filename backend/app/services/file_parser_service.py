@@ -108,12 +108,55 @@ class FileParserService:
     def parse_path(self, path: Path, file_ext: Optional[str] = None) -> str:
         ext = (file_ext or path.suffix.lower().lstrip(".")).lower()
 
+        markitdown_text = self._parse_with_markitdown(path)
+        if markitdown_text:
+            return markitdown_text
+
+        if ext == "pdf":
+            return self._parse_pdf(path)
+        if ext == "docx":
+            return self._parse_docx(path)
         if ext in {"txt", "md"}:
             return self._parse_text(path)
         raise UnsupportedFileTypeError(f"不支持的文件格式: {ext}")
 
+    def _parse_with_markitdown(self, path: Path) -> Optional[str]:
+        """Use MarkItDown when installed; otherwise fall back to local parsers."""
+        try:
+            from markitdown import MarkItDown
 
+            result = MarkItDown().convert(str(path))
+            text = getattr(result, "text_content", None) or str(result)
+            return text.strip() if text and text.strip() else None
+        except Exception:
+            return None
 
+    def _parse_pdf(self, path: Path) -> str:
+        try:
+            import fitz
+
+            doc = fitz.open(str(path))
+            pages = [page.get_text(sort=True) for page in doc]
+            doc.close()
+            return "\n\n".join(page for page in pages if page.strip())
+        except Exception as exc:
+            raise FileParserError(f"PDF 解析失败: {exc}") from exc
+
+    def _parse_docx(self, path: Path) -> str:
+        try:
+            from docx import Document
+
+            doc = Document(str(path))
+            paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            tables = []
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if cells:
+                        tables.append(" | ".join(cells))
+            return "\n\n".join(paragraphs + tables)
+        except Exception as exc:
+            raise FileParserError(f"Word 文档解析失败: {exc}") from exc
 
     def _parse_text(self, path: Path) -> str:
         for encoding in ("utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"):
