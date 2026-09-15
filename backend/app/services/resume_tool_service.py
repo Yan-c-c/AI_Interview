@@ -43,6 +43,48 @@ class BasicInfoCheckTool:
         return findings
 
 
+class StructureAnalysisTool:
+    name = "StructureAnalysisTool"
+
+    expected_order = ["基本信息", "求职意向", "教育背景", "专业技能", "项目经历", "实习经历", "工作经历", "荣誉奖项"]
+
+    def run(self, resume_text: str) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
+        text = "\n".join(lines)
+
+        located = []
+        for title in self.expected_order:
+            idx = text.find(title)
+            if idx >= 0:
+                located.append({"title": title, "position": idx})
+
+        missing_sections = [title for title in self.expected_order if title not in [item["title"] for item in located]]
+        if missing_sections:
+            findings.append({"type": "missing_section_clue", "items": missing_sections, "severity_hint": "medium"})
+
+        ordered_titles = [item["title"] for item in sorted(located, key=lambda item: item["position"])]
+        if ordered_titles and ordered_titles != [title for title in self.expected_order if title in ordered_titles]:
+            findings.append({"type": "section_order_clue", "items": ordered_titles, "severity_hint": "low"})
+
+        long_lines = [line for line in lines if len(line) > 120]
+        if long_lines:
+            findings.append(
+                {
+                    "type": "dense_content_clue",
+                    "items": long_lines[:8],
+                    "severity_hint": "medium",
+                    "tool_note": "长段落可能影响可读性，但需由 Agent 判断是否为内容堆砌。",
+                }
+            )
+
+        bullet_count = len([line for line in lines if line.startswith(("-", "•", "*", "·"))])
+        if bullet_count < 4 and len(lines) > 20:
+            findings.append({"type": "low_bullet_clue", "items": [f"条目化表达数量较少: {bullet_count}"], "severity_hint": "low"})
+
+        if not findings:
+            findings.append({"type": "structure_clue", "items": ["未发现明显结构异常线索"], "severity_hint": "low"})
+        return findings
 
 
 
