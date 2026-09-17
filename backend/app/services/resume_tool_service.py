@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.forbidden_words_service import ForbiddenWordsCheckTool
+from app.services.template_duplication_service import TemplateSimilarityCheckTool
 
 
 class BasicInfoCheckTool:
@@ -87,5 +89,22 @@ class StructureAnalysisTool:
         return findings
 
 
+class ResumeToolService:
+    """Runs local clue extraction tools for the LLM roundtable."""
+
+    def __init__(self) -> None:
+        self.basic_info_tool = BasicInfoCheckTool()
+        self.structure_tool = StructureAnalysisTool()
+        self.forbidden_words_tool = ForbiddenWordsCheckTool()
+        self.template_tool = TemplateSimilarityCheckTool()
+
+    def run_all(self, resume_text: str) -> dict[str, Any]:
+        return {
+            "basic_info_clues": self.basic_info_tool.run(resume_text),
+            "structure_clues": self.structure_tool.run(resume_text),
+            "forbidden_word_clues": self.forbidden_words_tool.run(resume_text),
+            "template_duplication_clues": self.template_tool.run(resume_text),
+        }
 
 
+resume_tool_service = ResumeToolService()
