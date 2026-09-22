@@ -81,3 +81,39 @@ class ResumeEvaluationAgent(BaseAgent):
         best = max(scored, key=lambda item: item[1])
         return best[0] if best[1] >= 2 else "未明确"
 
+    def _llm_unavailable_result(
+        self,
+        *,
+        tool_findings: dict[str, Any],
+        filename: str,
+        parsed_char_count: int,
+        target_position: str,
+        target_position_source: str,
+        errors: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "agent": self.name,
+            "task_type": self.task_type,
+            "success": False,
+            "report_status": "llm_unavailable",
+            "message": "AI 多专家圆桌会议暂时不可用，当前没有生成 AI 评估结论。",
+            "summary": {
+                "overall_score": None,
+                "risk_level": "未生成",
+                "target_position": target_position or "未明确",
+                "target_position_source": target_position_source,
+                "main_problems": [],
+                "main_suggestions": [],
+            },
+            "tool_findings": tool_findings,
+            "roundtable": {},
+            "metadata": {
+                "filename": filename,
+                "parsed_char_count": parsed_char_count,
+                "used_llm_roundtable": False,
+                "used_tool_clues": True,
+                "used_forbidden_word_tool": True,
+                "used_template_duplication_tool": True,
+                "llm_errors": errors,
+            },
+        }
