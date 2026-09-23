@@ -7,6 +7,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, StateGraph
 
 from app.core.resume_experts import EXPERTS
+from app.core.resume_reflector import ResumeReflectorAgent
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,17 @@ class ResumeRoundTableState(TypedDict, total=False):
 class ResumeRoundTableGraph:
     """LangGraph workflow for the resume multi-expert roundtable."""
 
+    def __init__(self) -> None:
+        builder = StateGraph(ResumeRoundTableState)
+        builder.add_node("expert_roundtable", self._expert_roundtable_node)
+        builder.add_node("reflector", self._reflector_node)
+        builder.set_entry_point("expert_roundtable")
+        builder.add_edge("expert_roundtable", "reflector")
+        builder.add_edge("reflector", END)
+        self.graph = builder.compile()
 
+    async def ainvoke(self, state: ResumeRoundTableState) -> ResumeRoundTableState:
+        return await self.graph.ainvoke(state)
 
 
     async def _expert_roundtable_node(self, state: ResumeRoundTableState) -> dict[str, Any]:
@@ -56,3 +67,26 @@ class ResumeRoundTableGraph:
             "llm_failed": len(errors) == len(EXPERTS),
         }
 
+    async def _reflector_node(self, state: ResumeRoundTableState) -> dict[str, Any]:
+        if state.get("llm_failed"):
+            return {"reflector_output": {}, "llm_failed": True}
+        try:
+            reflector = ResumeReflectorAgent()
+            output = await reflector.reflect(
+                resume_text=state["resume_text"],
+                user_message=state.get("user_message", ""),
+                target_position=state.get("target_position", ""),
+                target_position_source=state.get("target_position_source", "system_inferred"),
+                tool_findings=state.get("tool_findings", {}),
+                expert_outputs=state.get("expert_outputs", {}),
+                filename=state.get("filename", ""),
+                api_config=state.get("api_config"),
+            )
+            return {"reflector_output": output}
+        except Exception as exc:
+            logger.warning("Reflector failed: %s", exc)
+            return {
+                "reflector_output": {},
+                "llm_failed": True,
+                "errors": state.get("errors", []) + [f"reflector: {exc}"],
+            }
