@@ -23,6 +23,11 @@ from app.services.report_pdf_service import resume_report_pdf_service
 router = APIRouter(prefix="/api/resume", tags=["简历评估"])
 
 
+def _safe_pdf_filename(filename: str | None) -> str:
+    raw = (filename or "简历评估报告.pdf").strip()
+    if not raw.lower().endswith(".pdf"):
+        raw = f"{raw}.pdf"
+    return raw.replace("\r", "").replace("\n", "")[:120]
 
 
 @router.post("/evaluate", response_model=ResumeEvaluateResponse)
@@ -82,5 +87,22 @@ async def evaluate_resume_stream(request: ResumeEvaluateRequest):
     )
 
 
+@router.post("/report/pdf")
+async def download_resume_report_pdf(request: ResumeReportPdfRequest):
+    if not request.report:
+        raise HTTPException(status_code=400, detail={"error": "EmptyReport", "message": "报告内容为空，无法导出 PDF。"})
+
+    filename = _safe_pdf_filename(request.filename or request.report.get("metadata", {}).get("filename") or "简历评估报告.pdf")
+    try:
+        pdf_bytes = resume_report_pdf_service.render(request.report)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": "PdfRenderFailed", "message": "PDF 生成失败，请稍后重试。"}) from exc
+
+    quoted = quote(filename)
+    return Response(
+        pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quoted}"},
+    )
 
 
