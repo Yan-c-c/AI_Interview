@@ -106,3 +106,30 @@ async def download_resume_report_pdf(request: ResumeReportPdfRequest):
     )
 
 
+@router.post("/report/share", response_model=ResumeReportShareResponse)
+async def share_resume_report(request: ResumeReportShareRequest) -> ResumeReportShareResponse:
+    try:
+        email = normalize_email(request.email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "InvalidEmail", "message": "请输入有效的邮箱地址。"}) from exc
+
+    if not request.report:
+        raise HTTPException(status_code=400, detail={"error": "EmptyReport", "message": "报告内容为空，无法分享。" })
+
+    filename = _safe_pdf_filename(request.filename or request.report.get("metadata", {}).get("filename") or "简历评估报告.pdf")
+    try:
+        pdf_bytes = resume_report_pdf_service.render(request.report)
+        resume_report_email_sender.send_report_pdf(email=email, pdf_bytes=pdf_bytes, filename=filename)
+    except RuntimeError as exc:
+        error_key = str(exc)
+        if error_key == "smtp_not_configured":
+            message = "后端 SMTP 未配置，无法发送报告邮件。"
+        elif error_key == "smtp_invalid_port":
+            message = "SMTP 端口配置不正确。"
+        else:
+            message = "报告邮件发送失败，请检查 SMTP 配置或稍后重试。"
+        raise HTTPException(status_code=500, detail={"error": error_key, "message": message}) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": "ReportShareFailed", "message": "报告分享失败，请稍后重试。"}) from exc
+
+    return ResumeReportShareResponse(success=True, message="报告 PDF 已发送到指定邮箱。", email=email)
