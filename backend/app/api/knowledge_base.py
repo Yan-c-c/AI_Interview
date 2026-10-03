@@ -58,6 +58,9 @@ async def delete_document(document_id: str) -> dict[str, Any]:
     return {"success": True, "deleted": True, "document_id": document_id}
 
 
+@router.post("/query")
+async def query_knowledge_base(request: KnowledgeQueryRequest) -> dict[str, Any]:
+    return await knowledge_base_service.query(request.query, mode=request.mode, top_k=request.top_k)
 
 
 

@@ -155,6 +155,33 @@ class DocumentIndexService:
             self._write_json(self.text_chunks_path, text_chunks if isinstance(text_chunks, dict) else {})
         return changed
 
+    def search(self, query: str, *, top_k: int | None = None) -> list[LocalSearchHit]:
+        q = (query or "").strip()
+        if not q:
+            return []
+        chunks = self._read_json(self.text_chunks_path, {})
+        if not isinstance(chunks, dict):
+            return []
+        terms = self._query_terms(q)
+        limit = top_k or self.config.top_k
+        hits: list[LocalSearchHit] = []
+        for chunk_id, chunk in chunks.items():
+            if not isinstance(chunk, dict):
+                continue
+            content = str(chunk.get("content") or "")
+            score = self._score(content, terms, q)
+            if score <= 0:
+                continue
+            hits.append(
+                LocalSearchHit(
+                    chunk_id=str(chunk.get("_id") or chunk_id),
+                    doc_id=str(chunk.get("full_doc_id") or ""),
+                    file_path=str(chunk.get("file_path") or "面试知识库文档"),
+                    snippet=self._snippet(content, terms),
+                    score=score,
+                )
+            )
+        return sorted(hits, key=lambda item: item.score, reverse=True)[:limit]
 
 
     def _normalize_doc(self, doc_id: str, status: dict[str, Any], full_doc: Any) -> dict[str, Any]:
@@ -220,8 +247,41 @@ class DocumentIndexService:
         digest = hashlib.md5(f"{doc_id}:{index}:{chunk[:160]}".encode("utf-8")).hexdigest()
         return f"chunk-{digest}"
 
+    def _query_terms(self, query: str) -> list[str]:
+        terms = re.findall(r"[A-Za-z0-9_+#.-]+|[\u4e00-\u9fff]{2,}", query.lower())
+        if not terms:
+            return [query.lower()]
+        # Keep long Chinese queries useful by adding short phrase windows.
+        extra: list[str] = []
+        for term in terms:
+            if re.fullmatch(r"[\u4e00-\u9fff]{5,}", term):
+                extra.extend(term[index : index + 4] for index in range(0, len(term) - 3, 2))
+        return list(dict.fromkeys([*terms, *extra]))
 
+    def _score(self, content: str, terms: list[str], query: str) -> float:
+        normalized = content.lower()
+        score = 0.0
+        for term in terms:
+            if term and term in normalized:
+                score += normalized.count(term) * (2.0 if len(term) > 3 else 1.0)
+        if query.lower() in normalized:
+            score += 8.0
+        return score
 
+    def _snippet(self, content: str, terms: list[str]) -> str:
+        index = -1
+        lower = content.lower()
+        for term in terms:
+            index = lower.find(term)
+            if index >= 0:
+                break
+        if index < 0:
+            return content[:420].strip()
+        start = max(0, index - 160)
+        end = min(len(content), index + 360)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(content) else ""
+        return f"{prefix}{content[start:end].strip()}{suffix}"
 
     def _safe_filename(self, filename: str) -> str:
         name = Path(filename).name.strip() or "knowledge.txt"
