@@ -22,6 +22,9 @@ class KnowledgeTextRequest(BaseModel):
     text: str = Field(..., min_length=1)
 
 
+@router.get("/status")
+async def get_knowledge_status() -> dict[str, Any]:
+    return await knowledge_base_service.status()
 
 
 @router.get("/documents")

@@ -27,6 +27,28 @@ class KnowledgeBaseService:
         self.document_index = document_index or document_index_service
         self.graph_search = graph_search or graph_search_service
 
+    async def status(self) -> dict[str, Any]:
+        external = {"available": False, "status": "unavailable", "base_url": self.client.base_url}
+        try:
+            health = await self.client.health()
+            external = {"available": True, "status": "healthy", "base_url": self.client.base_url, "raw": health}
+        except Exception as exc:
+            external["error"] = str(exc)
+        local = self.document_index.status()
+        graph = self.graph_search.status()
+        return {
+            "success": True,
+            "module": "interview_knowledge_base",
+            "external_retrieval": external,
+            "local_index": local,
+            "graph": graph,
+            "config": {
+                "query_mode": self.config.query_mode,
+                "top_k": self.config.top_k,
+                "chunk_top_k": self.config.chunk_top_k,
+                "summary_language": self.config.summary_language,
+            },
+        }
 
     async def list_documents(self) -> list[dict[str, Any]]:
         return self.document_index.list_documents()

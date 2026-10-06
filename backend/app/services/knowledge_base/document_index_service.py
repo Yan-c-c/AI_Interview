@@ -183,6 +183,18 @@ class DocumentIndexService:
             )
         return sorted(hits, key=lambda item: item.score, reverse=True)[:limit]
 
+    def status(self) -> dict[str, Any]:
+        docs = self.list_documents()
+        chunks = self._read_json(self.text_chunks_path, {})
+        chunk_count = len(chunks) if isinstance(chunks, dict) else 0
+        processed = sum(1 for doc in docs if doc.get("status") == "processed")
+        return {
+            "document_count": len(docs),
+            "processed_document_count": processed,
+            "chunk_count": chunk_count,
+            "input_dir": str(self.input_dir),
+            "working_dir": str(self.working_dir),
+        }
 
     def _normalize_doc(self, doc_id: str, status: dict[str, Any], full_doc: Any) -> dict[str, Any]:
         content = ""
