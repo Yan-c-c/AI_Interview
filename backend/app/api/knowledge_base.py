@@ -66,5 +66,20 @@ async def query_knowledge_base(request: KnowledgeQueryRequest) -> dict[str, Any]
     return await knowledge_base_service.query(request.query, mode=request.mode, top_k=request.top_k)
 
 
+@router.get("/graph/labels")
+async def get_graph_labels(
+    q: str | None = Query(default=None, description="标签搜索关键词"),
+    limit: int = Query(default=40, ge=1, le=120),
+) -> dict[str, Any]:
+    labels = await knowledge_base_service.graph_labels(query=q, limit=limit)
+    return {"success": True, "labels": labels}
 
 
+@router.get("/graph")
+async def get_graph(
+    label: str | None = Query(default=None, description="图谱中心节点"),
+    max_depth: int = Query(default=2, ge=1, le=4),
+    max_nodes: int = Query(default=80, ge=5, le=300),
+) -> dict[str, Any]:
+    graph = await knowledge_base_service.graph(label=label, max_depth=max_depth, max_nodes=max_nodes)
+    return {"success": True, "graph": graph}

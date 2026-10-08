@@ -99,7 +99,13 @@ class KnowledgeBaseService:
             return []
         return await asyncio.gather(*(self.retrieve_for_agent(query) for query in queries))
 
+    async def graph_labels(self, *, query: str | None = None, limit: int = 60) -> list[dict[str, Any]]:
+        if query:
+            return self.graph_search.search_labels(query, limit=limit)
+        return self.graph_search.popular_labels(limit=limit)
 
+    async def graph(self, *, label: str | None = None, max_depth: int = 2, max_nodes: int = 120) -> dict[str, Any]:
+        return self.graph_search.get_graph(label, max_depth=max_depth, max_nodes=max_nodes)
 
     def _local_result(self, query: str, *, top_k: int | None = None) -> LightRAGQueryResult:
         hits = self.document_index.search(query, top_k=top_k or self.config.top_k)
