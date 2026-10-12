@@ -449,8 +449,46 @@ class InterviewQuestionGenerationAgent(BaseAgent):
             for index, (category, difficulty, question) in enumerate(base, start=1)
         ]
 
+    def _format_retrieval_context(self, results: list[LightRAGQueryResult]) -> str:
+        if not results:
+            return "未执行检索。"
+        parts: list[str] = []
+        for result in results:
+            parts.append(f"Query: {result.query}\nStatus: {result.status}\nResponse: {(result.response or '')[:1200]}")
+            for ref in result.references[:5]:
+                snippets = " ".join(ref.get("content") or [])[:700]
+                parts.append(f"Reference {ref.get('reference_id')}: {ref.get('file_path')}\n{snippets}")
+        return "\n\n".join(parts)[:8000]
 
+    def _source_list(self, results: list[LightRAGQueryResult]) -> list[dict[str, str]]:
+        sources: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for result in results:
+            for ref in result.references:
+                key = f"{ref.get('reference_id')}::{ref.get('file_path')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                content = ref.get("content") or []
+                snippet = str(content[0])[:220] if content else result.response[:220]
+                sources.append(
+                    {
+                        "reference_id": str(ref.get("reference_id") or ""),
+                        "title": str(ref.get("file_path") or "面试知识库来源"),
+                        "source": str(ref.get("file_path") or "面试知识库"),
+                        "snippet": snippet,
+                    }
+                )
+        return sources[:10]
 
+    def _retrieval_status(self, results: list[LightRAGQueryResult], has_lightrag_hit: bool) -> str:
+        if has_lightrag_hit:
+            return "hit"
+        if any(result.available for result in results):
+            return "fallback_no_lightrag_results"
+        if any(result.error for result in results):
+            return "unavailable"
+        return "not_configured"
 
     def _string_list(self, value: Any) -> list[str]:
         if isinstance(value, list):
