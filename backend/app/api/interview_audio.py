@@ -18,6 +18,10 @@ from app.services.file_parser_service import FileParserError, ParsedFileRecord, 
 router = APIRouter(prefix="/api/interview-audio", tags=["面试录音分析"])
 
 
+class TextToSpeechRequest(BaseModel):
+    text: str
+    per: int = Field(default=4115)
+    spd: int = Field(default=5)
 
 
 
@@ -46,3 +50,12 @@ async def speech_to_text(
     return {"success": True, "status": "success", "text": text}
 
 
+@router.post("/tts")
+async def text_to_speech(request: TextToSpeechRequest) -> Response:
+    try:
+        audio = baidu_speech_service.text_to_speech(request.text, per=request.per, spd=request.spd)
+    except BaiduSpeechError as exc:
+        raise HTTPException(status_code=503, detail={"error": "BaiduSpeechError", "message": str(exc)}) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={"error": "SpeechServiceUnavailable", "message": "语音合成服务暂时不可用。"}) from exc
+    return Response(content=audio, media_type="audio/wav")

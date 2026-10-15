@@ -93,6 +93,36 @@ class BaiduSpeechService:
             return str(data["result"][0]).strip()
         raise BaiduSpeechError(f"百度语音识别失败：err_no={data.get('err_no')}, msg={data.get('err_msg')}")
 
+    def text_to_speech(self, text: str, *, per: int = 4115, spd: int = 5) -> bytes:
+        if not text.strip():
+            raise BaiduSpeechError("合成文本为空")
+        token = self._ensure_token()
+        payload = urllib.parse.urlencode(
+            {
+                "tex": urllib.parse.quote_plus(text[:900]),
+                "tok": token,
+                "cuid": self.cuid,
+                "ctp": 1,
+                "lan": "zh",
+                "spd": spd,
+                "pit": 5,
+                "vol": 6,
+                "per": per,
+                "aue": 6,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.TTS_URL,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "")
+            content = response.read()
+        if content_type.startswith("audio"):
+            return content
+        raise BaiduSpeechError(f"百度语音合成失败：{content[:160]!r}")
 
 
 baidu_speech_service = BaiduSpeechService()
