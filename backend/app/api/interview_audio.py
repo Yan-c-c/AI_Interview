@@ -24,12 +24,68 @@ class TextToSpeechRequest(BaseModel):
     spd: int = Field(default=5)
 
 
+class AnalyzeAudioJsonRequest(BaseModel):
+    message: str = "请分析这段面试录音"
+    file_id: str | None = None
+    audio_url: str | None = None
+    session_id: str | None = None
+    api_config: dict[str, Any] | None = None
+
+
+@router.post("/analyze")
+async def analyze_interview_audio(request: Request) -> dict:
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        audio = form.get("audio") or form.get("file")
+        message = str(form.get("message") or "请分析这段面试录音")
+        audio_url = str(form.get("audio_url") or "") or None
+        if not isinstance(audio, UploadFile) and not audio_url:
+            raise HTTPException(status_code=400, detail={"message": "请上传音频文件或提供 audio_url。"})
+        record = None
+        if isinstance(audio, UploadFile):
+            try:
+                record = await file_parser_service.parse_upload(audio)
+            except (UnsupportedFileTypeError, FileParserError) as exc:
+                raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+        agent_request = AgentRequest(
+            message=message,
+            file_id=record.file_id if record else None,
+            filename=record.filename if record else "远程面试录音",
+            metadata={"audio_url": audio_url, "file_record": record.__dict__ if record else None},
+        )
+    else:
+        payload = await request.json()
+        data = AnalyzeAudioJsonRequest(**payload)
+        record = file_parser_service.get_record(data.file_id) if data.file_id else None
+        if data.file_id and not record:
+            raise HTTPException(status_code=404, detail={"message": "未找到上传的音频文件。"})
+        agent_request = AgentRequest(
+            message=data.message,
+            file_id=data.file_id,
+            filename=record.filename if record else "远程面试录音",
+            session_id=data.session_id,
+            api_config=data.api_config,
+            metadata={"audio_url": data.audio_url, "file_record": record.__dict__ if record else None},
+        )
+    response = await InterviewAudioAnalysisAgent().run(agent_request)
+    if not response.success:
+        return response.result
+    return response.result
 
 
 
 
-
-
+@router.get("/audio/{file_id}")
+async def get_audio_file(file_id: str) -> FileResponse:
+    record = file_parser_service.get_record(file_id)
+    if not record or not record.is_audio or not record.file_path:
+        raise HTTPException(status_code=404, detail={"message": "未找到音频文件。"})
+    path = Path(record.file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail={"message": "音频文件不存在。"})
+    media_type = "audio/mpeg" if record.file_type == "mp3" else f"audio/{record.file_type}"
+    return FileResponse(path, media_type=media_type, filename=record.filename)
 
 
 @router.post("/stt")
