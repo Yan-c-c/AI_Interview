@@ -74,6 +74,21 @@ async def analyze_interview_audio(request: Request) -> dict:
     return response.result
 
 
+@router.get("/{task_id}")
+async def get_interview_audio_task(task_id: str) -> dict:
+    task = audio_review_service.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"message": "未找到录音分析任务。"})
+    result = task.get("result")
+    has_content = isinstance(result, dict) and (
+        result.get("qa_analysis") or (isinstance(result.get("transcript"), dict) and result["transcript"].get("raw_text"))
+    )
+    if task.get("baidu_task_id") and not has_content:
+        try:
+            return await InterviewAudioAnalysisAgent().continue_task(task_id)
+        except BaiduASRError as exc:
+            return {"success": False, "task": task, "result": result, "message": str(exc)}
+    return {"success": True, "task": task, "result": task.get("result")}
 
 
 @router.get("/audio/{file_id}")
