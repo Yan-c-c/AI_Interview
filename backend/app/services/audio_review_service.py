@@ -45,6 +45,27 @@ class AudioReviewService:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         return self._load_tasks().get(task_id)
 
+    def find_reusable_task(
+        self,
+        *,
+        audio_file_id: str | None = None,
+        audio_url: str | None = None,
+        audio_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not audio_file_id and not audio_url and not audio_sha256:
+            return None
+        tasks = sorted(self._load_tasks().values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        for task in tasks:
+            if not self._matches_audio(task, audio_file_id=audio_file_id, audio_url=audio_url, audio_sha256=audio_sha256):
+                continue
+            if task.get("status") in {"created", "transcribing", "transcribed"} and (task.get("baidu_task_id") or isinstance(task.get("result"), dict)):
+                return task
+            if task.get("status") in {"completed", "reviewed"} and isinstance(task.get("result"), dict):
+                result = task["result"]
+                transcript = result.get("transcript") if isinstance(result.get("transcript"), dict) else {}
+                if transcript.get("raw_text") or result.get("qa_analysis"):
+                    return task
+        return None
 
     def save_task(self, task: dict[str, Any]) -> None:
         tasks = self._load_tasks()
@@ -88,7 +109,47 @@ class AudioReviewService:
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
 
+    def _matches_audio(
+        self,
+        task: dict[str, Any],
+        *,
+        audio_file_id: str | None,
+        audio_url: str | None,
+        audio_sha256: str | None,
+    ) -> bool:
+        if audio_file_id and task.get("audio_file_id") == audio_file_id:
+            return True
+        if audio_url and task.get("audio_url") == audio_url:
+            return True
+        if audio_sha256:
+            task_hash = str(task.get("audio_sha256") or "") or self._audio_hash_from_file_id(str(task.get("audio_file_id") or ""))
+            return task_hash == audio_sha256
+        return False
 
+    def _audio_hash_from_file_id(self, file_id: str) -> str:
+        if not file_id:
+            return ""
+        index_path = Path(__file__).resolve().parents[2] / "uploads" / "file_index.json"
+        if not index_path.exists():
+            return ""
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return ""
+        record = index.get(file_id) if isinstance(index, dict) else None
+        if not isinstance(record, dict):
+            return ""
+        existing = str(record.get("file_sha256") or "")
+        if existing:
+            return existing
+        path = Path(str(record.get("file_path") or ""))
+        if not path.exists():
+            return ""
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
 
 audio_review_service = AudioReviewService()
