@@ -229,7 +229,41 @@ class InterviewAudioAnalysisAgent(BaseAgent):
         return {"success": response.success, "task": audio_review_service.get_task(task_id), "result": response.result}
 
 
+    def _transcript_from_text(self, transcript_text: str) -> dict[str, Any]:
+        segments: list[dict[str, Any]] = []
+        lines = [line.strip() for line in transcript_text.splitlines() if line.strip()]
+        if not lines:
+            lines = [transcript_text.strip()]
+        for index, line in enumerate(lines):
+            speaker, text = self._parse_text_speaker(line, index)
+            segments.append(
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "start_time": f"00:{index:02d}",
+                    "end_time": f"00:{index + 1:02d}",
+                }
+            )
+        return {
+            "raw_text": transcript_text,
+            "segments": segments,
+            "baidu_task_id": "",
+            "raw_result": {},
+        }
 
+    def _parse_text_speaker(self, line: str, index: int) -> tuple[str, str]:
+        match = re.match(r"^\s*([^:：]{1,16})\s*[:：]\s*(.+)$", line)
+        if match:
+            label = match.group(1).strip().lower()
+            text = match.group(2).strip()
+            interviewer_labels = {"面试官", "hr", "interviewer", "问", "q", "老师", "招聘方"}
+            candidate_labels = {"候选人", "面试者", "candidate", "答", "a", "我", "学生", "求职者"}
+            if label in interviewer_labels:
+                return "speaker_0", text
+            if label in candidate_labels:
+                return "speaker_1", text
+            return "speaker_0" if any(token in label for token in interviewer_labels) else "speaker_1", text
+        return ("speaker_0" if ("?" in line or "？" in line or index % 2 == 0) else "speaker_1", line)
 
     def _processing_result(
         self,
@@ -283,13 +317,122 @@ class InterviewAudioAnalysisAgent(BaseAgent):
             },
         }
 
+    async def _identify_speakers(self, request: AgentRequest, transcript: dict[str, Any]) -> dict[str, str]:
+        segments = transcript.get("segments") or []
+        speakers = sorted({str(item.get("speaker") or "") for item in segments if item.get("speaker")})
+        if not speakers:
+            return {}
+        fallback = {speaker: ("interviewer" if index == 0 else "candidate") for index, speaker in enumerate(speakers)}
+        try:
+            llm = get_llm_for_request(request.api_config, channel="smart", temperature=0.1, max_tokens=1200)
+            sample = "\n".join(f"{item.get('speaker')}: {item.get('text')}" for item in segments[:80])
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content="你是面试录音话者角色识别 Agent。只输出 JSON，不要 markdown。"),
+                    HumanMessage(
+                        content=f"""根据下列转写片段判断每个 speaker 是面试官 interviewer 还是面试者 candidate。
+面试官通常负责提问、追问、引导；面试者通常负责回答、解释项目、说明方案。
+
+转写片段：
+{sample}
+
+输出格式：
+{{"speaker_mapping": {{"speaker_0": "interviewer", "speaker_1": "candidate"}}}}"""
+                    ),
+                ]
+            )
+            data = loads_json_response(str(response.content or ""))
+            mapping = data.get("speaker_mapping") if isinstance(data, dict) else None
+            if isinstance(mapping, dict):
+                normalized = {speaker: str(mapping.get(speaker) or fallback.get(speaker) or "candidate") for speaker in speakers}
+                for speaker, role in normalized.items():
+                    if role not in {"interviewer", "candidate"}:
+                        normalized[speaker] = fallback.get(speaker, "candidate")
+                return normalized
+        except Exception as exc:
+            logger.warning("speaker mapping failed: %s", exc)
+        return fallback
+
+    async def _split_qa_pairs(self, request: AgentRequest, transcript: dict[str, Any], speaker_mapping: dict[str, str]) -> list[dict[str, Any]]:
+        segments = self._apply_speaker_roles(transcript.get("segments") or [], speaker_mapping)
+        fallback = self._fallback_split_qa(segments)
+        try:
+            llm = get_llm_for_request(request.api_config, channel="smart", temperature=0.1, max_tokens=4200)
+            compact = "\n".join(f"{item.get('start_time')} {item.get('role')} {item.get('text')}" for item in segments[:160])
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content="你是面试录音问答切分 Agent。只输出 JSON，不要 markdown。"),
+                    HumanMessage(
+                        content=f"""请把面试转写切分为“面试官问题 + 面试者回答”的结构化问答对。
+要求保留开始和结束时间，问题要尽量合并追问上下文，回答只包含面试者内容。
+
+转写：
+{compact}
+
+输出 JSON：
+{{"qa_pairs": [
+  {{"question_id": "q1", "question": "", "answer": "", "interviewer_segments": [], "candidate_segments": [], "start_time": "00:00", "end_time": "00:00"}}
+]}}"""
+                    ),
+                ]
+            )
+            data = loads_json_response(str(response.content or ""))
+            qa_pairs = data.get("qa_pairs") if isinstance(data, dict) else None
+            if isinstance(qa_pairs, list) and qa_pairs:
+                return [self._normalize_qa(item, index) for index, item in enumerate(qa_pairs, start=1) if isinstance(item, dict)]
+        except Exception as exc:
+            logger.warning("qa split failed: %s", exc)
+        return fallback
 
 
 
+    def _apply_speaker_roles(self, segments: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[str, Any]]:
+        normalized = []
+        for item in segments:
+            speaker = str(item.get("speaker") or "")
+            normalized.append({**item, "role": mapping.get(speaker, "candidate")})
+        return normalized
 
+    def _fallback_split_qa(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pairs: list[dict[str, Any]] = []
+        current_question: list[dict[str, Any]] = []
+        current_answer: list[dict[str, Any]] = []
+        for item in segments:
+            if item.get("role") == "interviewer":
+                if current_question and current_answer:
+                    pairs.append(self._qa_from_segments(len(pairs) + 1, current_question, current_answer))
+                    current_question = []
+                    current_answer = []
+                current_question.append(item)
+            else:
+                if current_question:
+                    current_answer.append(item)
+        if current_question:
+            pairs.append(self._qa_from_segments(len(pairs) + 1, current_question, current_answer))
+        return pairs
 
+    def _qa_from_segments(self, index: int, questions: list[dict[str, Any]], answers: list[dict[str, Any]]) -> dict[str, Any]:
+        all_segments = [*questions, *answers]
+        return {
+            "question_id": f"q{index}",
+            "question": " ".join(str(item.get("text") or "") for item in questions).strip(),
+            "answer": " ".join(str(item.get("text") or "") for item in answers).strip(),
+            "interviewer_segments": questions,
+            "candidate_segments": answers,
+            "start_time": all_segments[0].get("start_time") if all_segments else "00:00",
+            "end_time": all_segments[-1].get("end_time") if all_segments else "00:00",
+        }
 
-
+    def _normalize_qa(self, item: dict[str, Any], index: int) -> dict[str, Any]:
+        return {
+            "question_id": str(item.get("question_id") or f"q{index}"),
+            "question": str(item.get("question") or "").strip(),
+            "answer": str(item.get("answer") or "").strip(),
+            "interviewer_segments": item.get("interviewer_segments") if isinstance(item.get("interviewer_segments"), list) else [],
+            "candidate_segments": item.get("candidate_segments") if isinstance(item.get("candidate_segments"), list) else [],
+            "start_time": str(item.get("start_time") or "00:00"),
+            "end_time": str(item.get("end_time") or "00:00"),
+        }
 
 
 
