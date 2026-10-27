@@ -228,6 +228,78 @@ class InterviewAudioAnalysisAgent(BaseAgent):
         )
         return {"success": response.success, "task": audio_review_service.get_task(task_id), "result": response.result}
 
+    async def _complete_analysis(
+        self,
+        *,
+        request: AgentRequest,
+        task_id: str,
+        transcript: dict[str, Any],
+        filename: str,
+        audio_file_id: str | None,
+        audio_url: str | None,
+        audio_sha256: str | None = None,
+        text_transcript: bool = False,
+    ) -> AgentResponse:
+        if not transcript.get("raw_text") and not transcript.get("segments"):
+            failed = audio_review_service.fail_task(task_id, "百度任务已返回，但没有可解析的转写文本。")
+            return AgentResponse(
+                success=False,
+                agent=self.name,
+                task_type=self.task_type,
+                message="百度任务已返回，但没有可解析的转写文本。",
+                result={"success": False, "task_id": task_id, "status": "transcription_empty", "task": failed},
+            )
+
+        speaker_mapping = await self._identify_speakers(request, transcript)
+        qa_pairs = await self._split_qa_pairs(request, transcript, speaker_mapping)
+        qa_analysis = []
+        used_lightrag = False
+        used_baidu_ai_search = False
+        for qa in qa_pairs:
+            evidence = await public_answer_search_service.search(qa.get("question") or "")
+            used_lightrag = used_lightrag or evidence["source_status"] == "lightrag_hit"
+            used_baidu_ai_search = used_baidu_ai_search or evidence["source_status"] == "baidu_ai_search_hit"
+            qa_analysis.append(await self._judge_answer(request, qa, evidence))
+
+        summary = await self._summarize_report(request, qa_analysis)
+        result = {
+            "agent": self.name,
+            "task_type": self.task_type,
+            "success": True,
+            "task_id": task_id,
+            "summary": summary,
+            "transcript": {
+                "raw_text": transcript.get("raw_text") or "",
+                "speaker_mapping": speaker_mapping,
+                "segments": self._apply_speaker_roles(transcript.get("segments") or [], speaker_mapping),
+            },
+            "qa_pairs": qa_pairs,
+            "qa_analysis": qa_analysis,
+            "review_status": "completed" if text_transcript else "pending_review",
+            "review_logs": audio_review_service.logs(task_id),
+            "metadata": {
+                "audio_filename": filename,
+                "audio_file_id": audio_file_id,
+                "audio_url": audio_url,
+                "audio_sha256": audio_sha256,
+                "baidu_task_id": transcript.get("baidu_task_id"),
+                "used_baidu_asr": not text_transcript,
+                "used_text_transcript": text_transcript,
+                "used_speaker_diarization": not text_transcript,
+                "used_lightrag": used_lightrag,
+                "used_baidu_ai_search": used_baidu_ai_search,
+                "used_deepseek": True,
+            },
+        }
+        task = audio_review_service.update_result(task_id, result)
+        result["review_logs"] = audio_review_service.logs(task_id)
+        return AgentResponse(
+            success=True,
+            agent=self.name,
+            task_type=self.task_type,
+            message="面试对话文本分析已完成。" if text_transcript else "面试录音分析已完成，等待讲师审核。",
+            result={"success": True, "task_id": task_id, "task": task, **result},
+        )
 
     def _transcript_from_text(self, transcript_text: str) -> dict[str, Any]:
         segments: list[dict[str, Any]] = []
@@ -384,7 +456,101 @@ class InterviewAudioAnalysisAgent(BaseAgent):
             logger.warning("qa split failed: %s", exc)
         return fallback
 
+    async def _judge_answer(self, request: AgentRequest, qa: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+        lightrag = evidence.get("lightrag")
+        baidu = evidence.get("baidu_ai_search")
+        source_status = evidence.get("source_status")
+        evidence_sources = list(evidence.get("evidence_sources") or [])
+        if not evidence_sources:
+            evidence_sources = [{"source_type": "deepseek_generated", "title": "DeepSeek 兜底生成", "url": "", "summary": "未检索到可靠题库或公开网页来源。"}]
+        try:
+            llm = get_llm_for_request(request.api_config, channel="smart", temperature=0.15, max_tokens=3600)
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content="你是技术面试答案评估专家。必须结合证据判断，不要只做关键词匹配。只输出 JSON。"),
+                    HumanMessage(
+                        content=f"""面试题：
+{qa.get('question')}
 
+学生回答：
+{qa.get('answer')}
+
+本地面试知识库检索：
+{getattr(lightrag, 'response', '') if lightrag else ''}
+{getattr(lightrag, 'references', []) if lightrag else []}
+
+百度 AI 搜索结果：
+{baidu.answer if baidu else ''}
+{baidu.sources if baidu else []}
+
+检索状态：{source_status}
+
+请生成该题的标准答案和准确性评估。若无可靠证据，必须说明来源为 deepseek_generated，不要编造 URL。
+输出 JSON：
+{{
+  "question": "",
+  "candidate_answer": "",
+  "standard_answer": "",
+  "accuracy_score": 85,
+  "accuracy_level": "基本准确",
+  "correct_points": [],
+  "missing_points": [],
+  "wrong_points": [],
+  "knowledge_points": [],
+  "evidence_sources": [],
+  "feedback": "",
+  "improvement_suggestion": ""
+}}"""
+                    ),
+                ]
+            )
+            data = loads_json_response(str(response.content or ""))
+            if isinstance(data, dict):
+                data.setdefault("question_id", qa.get("question_id"))
+                data.setdefault("question", qa.get("question"))
+                data.setdefault("candidate_answer", qa.get("answer"))
+                data["accuracy_score"] = self._score(data.get("accuracy_score"), default=70)
+                data["evidence_sources"] = self._normalize_sources(data.get("evidence_sources") or evidence_sources, evidence_sources)
+                return data
+        except Exception as exc:
+            logger.warning("answer judge failed: %s", exc)
+        return self._fallback_judge(qa, evidence_sources)
+
+    async def _summarize_report(self, request: AgentRequest, qa_analysis: list[dict[str, Any]]) -> dict[str, Any]:
+        fallback = self._fallback_summary(qa_analysis)
+        try:
+            llm = get_llm_for_request(request.api_config, channel="smart", temperature=0.15, max_tokens=2400)
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content="你是面试录音评估报告生成 Agent。只输出 JSON。"),
+                    HumanMessage(
+                        content=f"""根据逐题评估生成面试录音分析总报告：
+{qa_analysis}
+
+输出 JSON：
+{{
+  "overall_score": 82,
+  "accuracy_score": 78,
+  "expression_score": 85,
+  "project_depth_score": 80,
+  "completeness_score": 80,
+  "logic_score": 82,
+  "strengths": [],
+  "main_problems": [],
+  "question_scores": [],
+  "review_focus": [],
+  "main_suggestions": [],
+  "next_steps": []
+}}"""
+                    ),
+                ]
+            )
+            data = loads_json_response(str(response.content or ""))
+            if isinstance(data, dict):
+                return {**fallback, **data}
+        except Exception as exc:
+            logger.warning("audio report summary failed: %s", exc)
+        return fallback
 
     def _apply_speaker_roles(self, segments: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[str, Any]]:
         normalized = []
@@ -434,9 +600,67 @@ class InterviewAudioAnalysisAgent(BaseAgent):
             "end_time": str(item.get("end_time") or "00:00"),
         }
 
+    def _fallback_judge(self, qa: dict[str, Any], evidence_sources: list[dict[str, str]]) -> dict[str, Any]:
+        score = 65 if qa.get("answer") else 20
+        return {
+            "question_id": qa.get("question_id"),
+            "question": qa.get("question") or "",
+            "candidate_answer": qa.get("answer") or "",
+            "standard_answer": "当前未能完成完整证据综合，请讲师结合题库和候选人回答进一步审核。",
+            "accuracy_score": score,
+            "accuracy_level": "待人工复核" if score >= 60 else "回答不足",
+            "correct_points": [],
+            "missing_points": ["需要补充标准答案中的关键概念、适用场景和项目落地细节。"],
+            "wrong_points": [],
+            "knowledge_points": [],
+            "evidence_sources": evidence_sources,
+            "feedback": "AI 评估链路未完整完成，建议优先人工复核。",
+            "improvement_suggestion": "围绕问题核心概念、项目中的具体做法和结果进行结构化回答。",
+        }
 
+    def _fallback_summary(self, qa_analysis: list[dict[str, Any]]) -> dict[str, Any]:
+        scores = [self._score(item.get("accuracy_score"), default=60) for item in qa_analysis]
+        avg = round(sum(scores) / len(scores)) if scores else 0
+        return {
+            "overall_score": avg,
+            "accuracy_score": avg,
+            "expression_score": avg,
+            "project_depth_score": avg,
+            "completeness_score": avg,
+            "logic_score": avg,
+            "strengths": [],
+            "main_problems": ["部分问题仍需讲师复核标准答案和评分依据。"],
+            "question_scores": [{"question_id": item.get("question_id"), "score": item.get("accuracy_score")} for item in qa_analysis],
+            "review_focus": ["核对转写是否准确", "核对题目切分是否完整", "确认标准答案是否适合入库"],
+            "main_suggestions": ["优先修正低分问题的标准答案和知识点标签。"],
+            "next_steps": ["讲师审核通过后收录到面试知识库。"],
+        }
 
+    def _normalize_sources(self, value: Any, fallback: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not isinstance(value, list) or not value:
+            return fallback
+        sources = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            source_type = str(item.get("source_type") or "deepseek_generated")
+            if source_type not in {"lightrag", "baidu_ai_search", "deepseek_generated"}:
+                source_type = "deepseek_generated"
+            sources.append(
+                {
+                    "source_type": source_type,
+                    "title": str(item.get("title") or ""),
+                    "url": str(item.get("url") or ""),
+                    "summary": str(item.get("summary") or "")[:700],
+                }
+            )
+        return sources or fallback
 
+    def _score(self, value: Any, *, default: int) -> int:
+        try:
+            return max(0, min(100, int(float(value))))
+        except (TypeError, ValueError):
+            return default
 
     def _error(self, code: str, message: str) -> AgentResponse:
         return AgentResponse(
