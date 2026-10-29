@@ -90,12 +90,113 @@ class AudioReviewService:
         self.save_task(task)
         return task
 
+    async def approve(self, task_id: str, *, reviewer: str = "讲师", updates: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task or not isinstance(task.get("result"), dict):
+            raise ValueError("未找到可审核的录音分析任务。")
+        result = task["result"]
+        qa_analysis = list(result.get("qa_analysis") or [])
+        qa_analysis = self._apply_updates(qa_analysis, updates or [])
+        if not any(str(item.get("question") or "").strip() and str(item.get("standard_answer") or "").strip() for item in qa_analysis):
+            raise ValueError("当前分析结果没有可入库的题目和标准答案，请等待转写完成或先补充审核内容。")
+        ingest_text = self._format_ingest_text(qa_analysis, reviewer=reviewer)
+        document = await knowledge_base_service.insert_text(
+            title=f"面试录音审核收录-{task_id}.md",
+            text=ingest_text,
+        )
+        result["qa_analysis"] = qa_analysis
+        result["review_status"] = "approved"
+        result.setdefault("metadata", {})["knowledge_base_document_id"] = document.get("id")
+        result["metadata"]["knowledge_base_track_id"] = document.get("external_ingest", {}).get("track_id") or document.get("id")
+        task["status"] = "reviewed"
+        task["review_status"] = "approved"
+        task["result"] = result
+        self.save_task(task)
+        log = self._append_log(task_id, reviewer=reviewer, action="approve", detail={"document": document})
+        return {"success": True, "task": task, "knowledge_base_document": document, "review_log": log}
 
+    def reject(self, task_id: str, *, reviewer: str = "讲师", reason: str = "") -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task:
+            raise ValueError("未找到录音分析任务。")
+        if isinstance(task.get("result"), dict):
+            task["result"]["review_status"] = "rejected"
+        task["review_status"] = "rejected"
+        self.save_task(task)
+        log = self._append_log(task_id, reviewer=reviewer, action="reject", detail={"reason": reason})
+        return {"success": True, "task": task, "review_log": log}
 
+    def update(self, task_id: str, *, reviewer: str = "讲师", updates: list[dict[str, Any]]) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if not task or not isinstance(task.get("result"), dict):
+            raise ValueError("未找到可编辑的录音分析任务。")
+        task["result"]["qa_analysis"] = self._apply_updates(task["result"].get("qa_analysis") or [], updates)
+        task["review_status"] = "pending_review"
+        task["result"]["review_status"] = "pending_review"
+        self.save_task(task)
+        log = self._append_log(task_id, reviewer=reviewer, action="update", detail={"updates": updates})
+        return {"success": True, "task": task, "review_log": log}
 
+    def logs(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        logs = self._load_logs()
+        if task_id:
+            return [item for item in logs if item.get("task_id") == task_id]
+        return logs
 
+    def _apply_updates(self, qa_analysis: list[dict[str, Any]], updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_id = {str(item.get("question_id") or item.get("id") or index): item for index, item in enumerate(qa_analysis)}
+        for update in updates:
+            question_id = str(update.get("question_id") or "")
+            if not question_id or question_id not in by_id:
+                continue
+            item = by_id[question_id]
+            if update.get("question") is not None:
+                item["question"] = str(update["question"])
+            if update.get("standard_answer") is not None:
+                item["standard_answer"] = str(update["standard_answer"])
+            if update.get("knowledge_points") is not None:
+                item["knowledge_points"] = update["knowledge_points"]
+        return qa_analysis
 
+    def _format_ingest_text(self, qa_analysis: list[dict[str, Any]], *, reviewer: str) -> str:
+        now = self._now()
+        blocks = []
+        for item in qa_analysis:
+            question = str(item.get("question") or "").strip()
+            answer = str(item.get("standard_answer") or "").strip()
+            if not question or not answer:
+                continue
+            knowledge_points = item.get("knowledge_points") or item.get("missing_points") or []
+            blocks.append(
+                "\n".join(
+                    [
+                        "真实面试题：",
+                        f"问题：{question}",
+                        f"知识点：{', '.join(str(point) for point in knowledge_points) if isinstance(knowledge_points, list) else knowledge_points}",
+                        f"标准答案：{answer}",
+                        f"常见错误回答：{'; '.join(str(point) for point in item.get('wrong_points') or [])}",
+                        f"评分要点：{'; '.join(str(point) for point in item.get('correct_points') or [])}",
+                        "来源：面试录音审核收录",
+                        f"审核人：{reviewer}",
+                        f"审核时间：{now}",
+                    ]
+                )
+            )
+        return "\n\n---\n\n".join(blocks) or "面试录音审核未产生可入库题目。"
 
+    def _append_log(self, task_id: str, *, reviewer: str, action: str, detail: dict[str, Any]) -> dict[str, Any]:
+        logs = self._load_logs()
+        log = {
+            "log_id": str(uuid.uuid4()),
+            "task_id": task_id,
+            "reviewer": reviewer,
+            "action": action,
+            "detail": detail,
+            "created_at": self._now(),
+        }
+        logs.append(log)
+        self.logs_path.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+        return log
 
     def _load_tasks(self) -> dict[str, Any]:
         if not self.tasks_path.exists():
@@ -105,6 +206,14 @@ class AudioReviewService:
         except json.JSONDecodeError:
             return {}
 
+    def _load_logs(self) -> list[dict[str, Any]]:
+        if not self.logs_path.exists():
+            return []
+        try:
+            data = json.loads(self.logs_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
