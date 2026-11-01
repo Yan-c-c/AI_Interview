@@ -72,7 +72,72 @@ class CoverLetterService:
         self._save_history(report)
         return report
 
+    async def rewrite(self, *, report: dict[str, Any], instruction: str, api_config: dict | None = None) -> dict[str, Any]:
+        instruction = instruction.strip()
+        if not instruction:
+            raise ValueError("empty_instruction")
+        used_deepseek = True
+        llm_errors: list[str] = []
+        try:
+            llm = get_llm_for_request(api_config, channel="smart", temperature=0.35, max_tokens=3600)
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content="你是求职信改写 Agent。根据用户要求改写已有求职信，保持事实不编造。只输出 JSON。"),
+                    HumanMessage(
+                        content=f"""用户修改要求：
+{instruction}
 
+已有求职信结果：
+{json.dumps(report, ensure_ascii=False)[:12000]}
+
+请输出 JSON，结构与原报告的 versions 字段一致，只需要返回：
+{{
+  "versions": {{
+    "custom": {{"title": "", "body": ""}},
+    "standard": {{"title": "", "body": ""}},
+    "email_short": {{"title": "", "body": ""}},
+    "technical": {{"title": "", "body": ""}},
+    "campus_internship": {{"title": "", "body": ""}}
+  }},
+  "optimization_suggestions": ["后续可继续优化点"],
+  "email": {{"subject": "", "body": ""}}
+}}"""
+                    ),
+                ]
+            )
+            data = loads_json_response(str(response.content or ""))
+            if not isinstance(data, dict):
+                raise ValueError("rewrite response is not object")
+        except Exception as exc:
+            used_deepseek = False
+            llm_errors.append(str(exc))
+            data = self._fallback_rewrite(report, instruction)
+
+        updated = dict(report)
+        versions = dict(report.get("versions") or {})
+        versions.update(self._normalize_versions(data.get("versions")))
+        updated["versions"] = versions
+        updated["optimization_suggestions"] = _string_list(data.get("optimization_suggestions"))[:8] or report.get("optimization_suggestions", [])
+        if isinstance(data.get("email"), dict):
+            updated["email"] = data["email"]
+        updated["metadata"] = {
+            **(report.get("metadata") or {}),
+            "used_deepseek_rewrite": used_deepseek,
+            "rewrite_instruction": instruction,
+            "rewrite_errors": llm_errors,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_history(updated)
+        return updated
+
+    def history(self, limit: int = 20) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for path in sorted(self.history_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]:
+            try:
+                items.append(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                continue
+        return items
 
     async def _call_generation_llm(
         self,
@@ -281,6 +346,18 @@ class CoverLetterService:
             "email": {"subject": f"{position}求职申请", "body": body},
         }
 
+    def _fallback_rewrite(self, report: dict[str, Any], instruction: str) -> dict[str, Any]:
+        standard = (report.get("versions") or {}).get("standard") or {}
+        body = str(standard.get("body") or "")
+        return {
+            "versions": {
+                "custom": {
+                    "title": f"{standard.get('title') or '求职信'} - 改写版",
+                    "body": f"{body}\n\n【改写要求记录】{instruction}",
+                }
+            },
+            "optimization_suggestions": ["DeepSeek 改写暂时不可用，已保留修改要求，建议稍后重新生成。"],
+        }
 
     def _save_history(self, report: dict[str, Any]) -> None:
         history_id = (report.get("metadata") or {}).get("history_id") or str(uuid.uuid4())
