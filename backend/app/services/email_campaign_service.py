@@ -157,8 +157,40 @@ class EmailCampaignService:
             )
         return normalized, warnings
 
+    def _normalize_attachments(self, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in attachments:
+            if item.get("selected") is False:
+                continue
+            file_id = str(item.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            record = file_parser_service.get_record(file_id)
+            if not record or not record.file_path or not Path(record.file_path).exists():
+                raise FileNotFoundError("attachment_not_found")
+            path = Path(record.file_path)
+            size = path.stat().st_size
+            if size > MAX_ATTACHMENT_SIZE:
+                raise ValueError("attachment_too_large")
+            normalized.append(
+                {
+                    "file_id": record.file_id,
+                    "filename": item.get("filename") or record.filename,
+                    "file_type": record.file_type,
+                    "size": size,
+                    "selected": True,
+                }
+            )
+        return normalized
 
 
+    def _render(self, template: str, recipient: dict[str, Any]) -> str:
+        values = {
+            "name": recipient.get("name") or "您好",
+            "company": recipient.get("company") or "贵公司",
+            "position": recipient.get("position") or "相关岗位",
+        }
+        return VARIABLE_RE.sub(lambda match: values.get(match.group(1).lower(), ""), template)
 
     def _summary(self, results: list[dict[str, Any]]) -> dict[str, int]:
         counts = {"total": len(results), "success": 0, "failed": 0, "pending": 0, "sending": 0, "skipped": 0}
