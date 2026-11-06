@@ -45,6 +45,14 @@ class EmailCampaignService:
             },
         }
 
+    def test_smtp(self, smtp_config: dict[str, Any]) -> dict[str, Any]:
+        config = smtp_service.from_dict(smtp_config)
+        result = smtp_service.test_connection(config)
+        return {
+            "agent": "email_campaign_agent",
+            "task_type": "email_campaign",
+            **result,
+        }
 
     def create_task(self, request: EmailCampaignCreateRequest) -> dict[str, Any]:
         config = smtp_service.from_dict(request.smtp_config.model_dump())
@@ -98,6 +106,52 @@ class EmailCampaignService:
         self._save_task(task)
         return task
 
+    def send_task(self, request: EmailCampaignSendRequest) -> dict[str, Any]:
+        if not request.confirm:
+            raise ValueError("send_not_confirmed")
+        task = self.get_task(request.task_id)
+        if not task:
+            raise FileNotFoundError("task_not_found")
+        config = smtp_service.from_dict(request.smtp_config.model_dump())
+        attachments = self._load_attachments(task.get("attachments") or [])
+        task["status"] = "sending"
+        self._touch(task)
+
+        results = task.get("send_results") or []
+        by_id = {item.get("recipient_id"): item for item in results}
+        recipients = task.get("recipients") or []
+        for recipient in recipients:
+            result = by_id.get(recipient["id"])
+            if not result:
+                continue
+            if result.get("status") == "success":
+                continue
+            result["status"] = "sending"
+            result["error"] = ""
+            result["subject"] = self._render(task["subject"], recipient) if task.get("personalize", True) else task["subject"]
+            rendered_content = self._render(task["content"], recipient) if task.get("personalize", True) else task["content"]
+            result["content_preview"] = rendered_content[:600]
+            self._touch(task)
+            try:
+                smtp_service.send(
+                    config=config,
+                    to_email=recipient["email"],
+                    subject=result["subject"],
+                    body=rendered_content,
+                    attachments=attachments,
+                )
+                result["status"] = "success"
+                result["sent_at"] = datetime.now().isoformat(timespec="seconds")
+            except Exception as exc:
+                result["status"] = "failed"
+                result["error"] = self._friendly_error(exc)
+            task["send_summary"] = self._summary(results)
+            self._touch(task)
+
+        task["status"] = "completed"
+        task["send_summary"] = self._summary(results)
+        self._touch(task)
+        return task
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         path = self.data_dir / f"{task_id}.json"
@@ -183,6 +237,24 @@ class EmailCampaignService:
             )
         return normalized
 
+    def _load_attachments(self, attachments: list[dict[str, Any]]) -> list[EmailAttachment]:
+        loaded: list[EmailAttachment] = []
+        for item in attachments:
+            record = file_parser_service.get_record(str(item.get("file_id") or ""))
+            if not record or not record.file_path or not Path(record.file_path).exists():
+                raise FileNotFoundError("attachment_not_found")
+            path = Path(record.file_path)
+            mime, _ = mimetypes.guess_type(record.filename)
+            maintype, subtype = (mime or "application/octet-stream").split("/", 1)
+            loaded.append(
+                EmailAttachment(
+                    filename=str(item.get("filename") or record.filename),
+                    content=path.read_bytes(),
+                    maintype=maintype,
+                    subtype=subtype,
+                )
+            )
+        return loaded
 
     def _render(self, template: str, recipient: dict[str, Any]) -> str:
         values = {
@@ -199,6 +271,14 @@ class EmailCampaignService:
             counts[status] = counts.get(status, 0) + 1
         return counts
 
+    def _friendly_error(self, exc: Exception) -> str:
+        messages = {
+            "smtp_auth_failed": "SMTP 认证失败，请检查邮箱账号和授权码。",
+            "smtp_connection_failed": "SMTP 连接失败，请检查 Host、端口和 SSL/TLS 配置。",
+            "email_send_failed": "邮件发送失败，请检查收件人或 SMTP 服务限制。",
+            "attachment_not_found": "附件不存在或已失效。",
+        }
+        return messages.get(str(exc), str(exc) or "发送失败")
 
     def _touch(self, task: dict[str, Any]) -> None:
         task["updated_at"] = datetime.now().isoformat(timespec="seconds")
