@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "智能面试助手"
+    },
+    {
+      "name": "module_desc",
+      "value": "智能面试助手 Harmony 轻量用户版"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "智能面试助手入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "智能面试助手"
+    },
+    {
+      "name": "internet_reason",
+      "value": "用于连接智能面试助手后端服务"
+    }
+  ]
+}
